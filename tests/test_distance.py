@@ -8,8 +8,9 @@ from app.sensors.distance.distance import Distance, MeasurementError
 
 class TestDistance(unittest.TestCase):
 
+    @patch('app.sensors.distance.distance.PiGPIOFactory')
     @patch('app.sensors.distance.distance.DistanceSensor', autospec=True)
-    def setUp(self, MockDistanceSensor):
+    def setUp(self, MockDistanceSensor, MockPiGPIOFactory):
         # Mock the behavior of the DistanceSensor so it returns some fixed values
         self.mock_sensor = MockDistanceSensor.return_value
         self.mock_sensor.distance = 0.5
