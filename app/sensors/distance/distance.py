@@ -97,10 +97,36 @@ class Distance:
             mid = data_length // 2
             return [(sorted_data[mid - 1] + sorted_data[mid]) / 2]
 
+    def cleanup(self):
+        """
+        Properly closes the sensor and pin factory connections.
+        """
+        try:
+            if hasattr(self, 'sensor') and self.sensor:
+                self.sensor.close()
+            if hasattr(self, 'pin_factory') and self.pin_factory:
+                self.pin_factory.close()
+        except Exception as e:
+            print(f"Warning during cleanup: {e}")
+
+    def __enter__(self):
+        """
+        Context manager entry.
+        """
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        Context manager exit, ensuring resources are closed.
+        """
+        self.cleanup()
+        return False
+
 if __name__ == "__main__":
     """
     If the module is executed as a standalone script, it will return the distance in a telegraf friendly format.
     """
+    distance_instance = None
     try:
         distance_instance = Distance()
         distance = distance_instance.measure()
@@ -109,3 +135,6 @@ if __name__ == "__main__":
         print(f"Error: {e}")
     except KeyboardInterrupt:
         print("Script interrupted.")
+    finally:
+        if distance_instance:
+            distance_instance.cleanup()

@@ -6,3 +6,6 @@ venv/
 # If using Jython
 *.class
 .env
+
+# Runtime logs
+*.log

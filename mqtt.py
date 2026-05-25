@@ -8,7 +8,7 @@ import json
 # import picamera
 # import cv2
 from time import sleep
-from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_TOPIC, IDENTIFIER, MODEL, VERSION, WATER_LOW_CM, UPPER_CAMERA_DEVICE, LOWER_CAMERA_DEVICE, UPPER_IMAGE_PATH, LOWER_IMAGE_PATH, CAMERA_RESOLUTION, IMAGE_INTERVAL_SECONDS
+from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_TOPIC, IDENTIFIER, MODEL, VERSION, WATER_LOW_CM, DISTANCE_SENSOR_ENABLED, UPPER_CAMERA_DEVICE, LOWER_CAMERA_DEVICE, UPPER_IMAGE_PATH, LOWER_IMAGE_PATH, CAMERA_RESOLUTION, IMAGE_INTERVAL_SECONDS
 
 from gpiozero import Button  # Import gpiozero Button
 from gpiozero.pins.pigpio import PiGPIOFactory
@@ -45,7 +45,7 @@ pin_factory = PiGPIOFactory()
 
 pump = Pump(pin_factory=pin_factory)
 light = Light(pin_factory=pin_factory)
-distance_sensor = Distance(pin_factory=pin_factory)
+distance_sensor = Distance(pin_factory=pin_factory) if DISTANCE_SENSOR_ENABLED else None
 
 # default on brightness
 brightness  = 50
@@ -138,6 +138,8 @@ def flash_lights(times=3, delay=0.3):
         light.off()
 
 def safe_distance_measure():
+    if not DISTANCE_SENSOR_ENABLED:
+        return None
     global distance_sensor
     try:
         return distance_sensor.measure_once()
@@ -151,7 +153,7 @@ def safe_distance_measure():
             return None
 
 def publish_water_low_mode(client):
-    if WATER_LOW_CM not in (None, 0):
+    if DISTANCE_SENSOR_ENABLED and WATER_LOW_CM not in (None, 0):
         mode = "Enabled"
     else:
         mode = "Disabled"
@@ -160,6 +162,11 @@ def publish_water_low_mode(client):
 
 
 def update_water_low_state(client):
+    if not DISTANCE_SENSOR_ENABLED:
+        client.publish(BASE_TOPIC + "/water/low/state", "OFF", retain=True)
+        logger.info("Distance sensor disabled, setting water low state to OFF")
+        return
+
     if WATER_LOW_CM not in (None, 0):
         distance = safe_distance_measure()
         if distance is not None:
@@ -379,7 +386,7 @@ def on_message(client, userdata, msg):
         # === Pump Logic ===
         if topic_suffix == "pump/command":
             if payload.upper() == "ON":
-                if WATER_LOW_CM not in (None, 0):
+                if DISTANCE_SENSOR_ENABLED and WATER_LOW_CM not in (None, 0):
                     distance = safe_distance_measure()
                     if distance is not None and distance > WATER_LOW_CM:
                         logger.warning(f"Water too low ({distance:.2f}cm > {WATER_LOW_CM:.2f}cm), aborting pump")
@@ -415,9 +422,10 @@ def on_message(client, userdata, msg):
 
         # === Water Level ===
         elif topic_suffix == "water/level/get":
-            distance = safe_distance_measure()
-            if distance is not None:
-                client.publish(BASE_TOPIC + "/water/level", f"{distance:.2f}")
+            if DISTANCE_SENSOR_ENABLED:
+                distance = safe_distance_measure()
+                if distance is not None:
+                    client.publish(BASE_TOPIC + "/water/level", f"{distance:.2f}")
 
         elif topic_suffix == "water/low/cm/set":
             try:
@@ -440,6 +448,9 @@ def on_message(client, userdata, msg):
         elif topic_suffix == "humidity/get":
             humidity = humidity_sensor.read()
             client.publish(BASE_TOPIC + "/humidity", f"{humidity:.2f}")
+
+        elif topic_suffix == "image/capture":
+            threading.Thread(target=capture_images, args=(client,), daemon=True).start()
 
     except Exception as e:
         logger.exception(f"Error handling message on topic {msg.topic}: {e}")
@@ -475,6 +486,8 @@ def publish_humidity(client):
         sleep(30*60)  # Publish frequency, every x seconds
 
 def publish_water_level(client):
+    if not DISTANCE_SENSOR_ENABLED:
+        return
     while True:
         distance = safe_distance_measure()
         if distance is not None:
@@ -482,34 +495,33 @@ def publish_water_level(client):
             client.publish(BASE_TOPIC + "/water/level", f"{distance:.2f}")
         sleep(30 * 60)
 
+def capture_images(client):
+    subprocess.check_call([
+        'fswebcam', '-d', UPPER_CAMERA_DEVICE, '-r', CAMERA_RESOLUTION,
+        '-S', '2', '-F', '2', '--no-banner', UPPER_IMAGE_PATH
+    ])
+    logger.info(f"Captured image from upper camera ({UPPER_CAMERA_DEVICE})")
+
+    subprocess.check_call([
+        'fswebcam', '-d', LOWER_CAMERA_DEVICE, '-r', CAMERA_RESOLUTION,
+        '-S', '2', '-F', '2', '--no-banner', LOWER_IMAGE_PATH
+    ])
+    logger.info(f"Captured image from lower camera ({LOWER_CAMERA_DEVICE})")
+
+    with open(UPPER_IMAGE_PATH, 'rb') as f:
+        upper_cam_jpeg_data = f.read()
+        client.publish(BASE_TOPIC + "/image/upper_camera", payload=upper_cam_jpeg_data, qos=0, retain=False)
+        logger.info("Published image to /image/upper_camera")
+
+    with open(LOWER_IMAGE_PATH, 'rb') as f:
+        lower_cam_jpeg_data = f.read()
+        client.publish(BASE_TOPIC + "/image/lower_camera", payload=lower_cam_jpeg_data, qos=0, retain=False)
+        logger.info("Published image to /image/lower_camera")
+
 def publish_images(client):
     while True:
         try:
-            # Capture upper camera image
-            subprocess.check_call([
-                'fswebcam', '-d', UPPER_CAMERA_DEVICE, '-r', CAMERA_RESOLUTION,
-                '-S', '2', '-F', '2', '--no-banner', UPPER_IMAGE_PATH
-            ])
-            logger.info(f"Captured image from upper camera ({UPPER_CAMERA_DEVICE})")
-
-            # Capture lower camera image
-            subprocess.check_call([
-                'fswebcam', '-d', LOWER_CAMERA_DEVICE, '-r', CAMERA_RESOLUTION,
-                '-S', '2', '-F', '2', '--no-banner', LOWER_IMAGE_PATH
-            ])
-            logger.info(f"Captured image from lower camera ({LOWER_CAMERA_DEVICE})")
-
-            # Publish upper camera image
-            with open(UPPER_IMAGE_PATH, 'rb') as f:
-                upper_cam_jpeg_data = f.read()  # Read as raw binary
-                client.publish(BASE_TOPIC + "/image/upper_camera", payload=upper_cam_jpeg_data, qos=0, retain=False)
-                logger.info("Published image to /image/upper_camera")
-
-            # Publish lower camera image
-            with open(LOWER_IMAGE_PATH, 'rb') as f:
-                lower_cam_jpeg_data = f.read()  # Read as raw binary
-                client.publish(BASE_TOPIC + "/image/lower_camera", payload=lower_cam_jpeg_data, qos=0, retain=False)
-                logger.info("Published image to /image/lower_camera")
+            capture_images(client)
 
         except subprocess.CalledProcessError as e:
             logger.error(f"Camera capture failed: {e}")
@@ -521,7 +533,7 @@ def publish_images(client):
 
 if __name__ == "__main__":
     logger.info(f"Connecting to {BROKER} on port {PORT} with keep alive {KEEP_ALIVE_INTERVAL}")
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"{IDENTIFIER}_mqtt")
     client.on_connect = on_connect
     client.on_message = on_message
     client.username_pw_set(USERNAME, PASSWORD)
