@@ -30,6 +30,8 @@ Work in progress. We should be picking up some steam here to give the DYI commun
     - [Prerequisites](#prerequisites)
   - [Usage](#usage)
     - [MQTT with HomeAssistant](#mqtt-with-homeassistant)
+      - [Home Assistant Dashboard](#home-assistant-dashboard)
+      - [Manual MQTT Tests](#manual-mqtt-tests)
     - [Testing](#testing)
     - [Controlling Individual Sensors](#controlling-individual-sensors)
     - [REST API](#rest-api)
@@ -87,7 +89,7 @@ nano .env
 Install dependencies, and run services pigpiod, mqtt.service
 
 ```
-./bin/setup.sh`
+./bin/setup.sh
 ```
 
 Ensure the pigpiod daemon is running
@@ -114,104 +116,201 @@ sudo systemctl status mqtt.service
 
 ### MQTT with HomeAssistant
 
-For homeassistant:
+This fork is designed to run the Gardyn control service on the Raspberry Pi inside the Gardyn, while Home Assistant and Mosquitto can run on a separate box such as a Beelink.
 
-You need a mqtt broker either on the gardyn pi or homeassistant.
+Recommended layout:
 
-To install on the pi run
+- Gardyn Pi: runs `pigpiod` and `mqtt.service`
+- Beelink/Home Assistant: runs the MQTT broker
+- Home Assistant: uses MQTT discovery to create the Gardyn entities
 
-```
-sudo apt-get install mosquitto mosquitto-clients
-```
+On the Gardyn Pi, set `.env` to point at the Home Assistant broker:
 
-Add mqtt-broker username and password:
-
-`sudo mosquitto_passwd -c /etc/mosquitto/passwd <USERNAME>`
-
-> Note: make sure to update the .env file which is used by `config.py` for `mqtt.py`
-
-Run `sudo nano /etc/mosquitto/mosquitto.conf` and change the following lines to match:
-
-```
-allow_anonymous false
-password_file /etc/mosquitto/passwd
-listener 1883
+```bash
+MQTT_BROKER=<home-assistant-or-beelink-ip>
+MQTT_PORT=1883
+MQTT_USERNAME=gardyn
+MQTT_PASSWORD=somepassword
+MQTT_BASETOPIC=gardyn
+MQTT_IDENTIFIER=gardyn_03
 ```
 
+On Home Assistant, install or enable the Mosquitto broker add-on, create the `gardyn` MQTT user, then add the MQTT integration under **Settings -> Devices & services -> MQTT**. After `mqtt.service` connects, the device should appear through MQTT discovery.
 
-Here are some additional options that you could set in `/etc/mosquitto/mosquitto.conf`:
+Restart and watch the Pi service:
 
-```
-pid_file /run/mosquitto/mosquitto.pid
-
-persistence true
-persistence_location /var/lib/mosquitto/
-
-log_dest file /var/log/mosquitto/mosquitto.log
-
-listener 1883 0.0.0.0
-
-allow_anonymous false
-password_file /etc/mosquitto/passwd
-
-include_dir /etc/mosquitto/conf.d
+```bash
+sudo systemctl restart mqtt.service
+sudo journalctl -u mqtt.service -f
 ```
 
+To confirm the Pi is publishing to the broker, run this from any machine with `mosquitto-clients` installed:
 
-Restart the service
-
-```
-sudo systemctl restart mosquitto
-```
-
-you just need to edit the `.env` with the mosquitto username and password created above in /etc/mosquitto/passwd.
-
-
-Check the configuration works:
-
-`sudo journalctl -xeu mosquitto.service`
-
-
-If you havent already, run `./bin/setup.sh`, this will install all OS dependencies, install the python libs, and run services pigpiod, mqtt.service
-
-Ensure the pigpiod, mqtt, and broker daemon is running
-
-```
-sudo systemctl status pigpiod
-sudo systemctl status mqtt.service
-sudo systemctl status mosquitto
+```bash
+mosquitto_sub -h <home-assistant-or-beelink-ip> -u gardyn -P "somepassword" -t "gardyn/#" -v
 ```
 
-Go to your homeassistant instance:
-If your broker is on the gardyn pi, make sure to install the service mqtt, go to settings->devices&services->mqtt and add your gardyn pi host, port, username and password.
-The device should then appear in your homeassistant discovery settings.
+#### Home Assistant Dashboard
 
-To test locally on gardyn pi:
+Add a manual Lovelace card and adjust entity IDs to match the entities discovered under **Settings -> Devices & services -> MQTT -> Gardyn**. Home Assistant may suffix entity IDs if names already exist.
+
+```yaml
+type: sections
+title: Gardyn
+sections:
+  - type: grid
+    cards:
+      - type: heading
+        heading: Controls
+      - type: tile
+        entity: light.gardyn_03_light
+        name: Light
+        features:
+          - type: light-brightness
+      - type: tile
+        entity: light.gardyn_03_pump
+        name: Pump
+        features:
+          - type: light-brightness
+      - type: entities
+        title: Environment
+        entities:
+          - entity: sensor.gardyn_03_temperature
+            name: Air temperature
+          - entity: sensor.gardyn_03_humidity
+            name: Humidity
+          - entity: sensor.gardyn_03_pcb_temp
+            name: PCB temperature
+
+  - type: grid
+    cards:
+      - type: heading
+        heading: Water
+      - type: entities
+        entities:
+          - entity: binary_sensor.gardyn_03_water_low
+            name: Water low
+          - entity: sensor.gardyn_03_water_level
+            name: Water level
+          - entity: number.gardyn_03_water_low_cm
+            name: Low-water threshold
+          - entity: sensor.gardyn_03_water_low_mode
+            name: Low-water guard
+          - entity: sensor.gardyn_03_water_refill_amount
+            name: Refill amount
+
+  - type: grid
+    cards:
+      - type: heading
+        heading: Food
+      - type: entities
+        entities:
+          - entity: binary_sensor.gardyn_03_food_needed
+            name: Food needed
+          - entity: sensor.gardyn_03_last_fed
+            name: Last fed
+          - entity: sensor.gardyn_03_food_amount
+            name: Food amount
+          - entity: button.gardyn_03_log_feeding
+            name: Log feeding
+
+  - type: grid
+    cards:
+      - type: heading
+        heading: Grow Cycle
+      - type: entities
+        entities:
+          - entity: sensor.gardyn_03_grow_day
+            name: Grow day
+          - entity: sensor.gardyn_03_grow_next_task
+            name: Next task
+          - entity: binary_sensor.gardyn_03_grow_thin_needed
+            name: Thin sprouts
+          - entity: binary_sensor.gardyn_03_grow_roots_check_needed
+            name: Check roots
+          - entity: binary_sensor.gardyn_03_grow_trim_needed
+            name: Trim plants
+          - entity: binary_sensor.gardyn_03_grow_harvest_needed
+            name: Harvest
+          - entity: binary_sensor.gardyn_03_grow_tank_refresh_needed
+            name: Refresh tank
+          - entity: sensor.gardyn_03_grow_tank_refresh_status
+            name: Tank refresh status
+      - type: entities
+        title: Log grow tasks
+        entities:
+          - entity: button.gardyn_03_grow_start_cycle
+          - entity: button.gardyn_03_grow_log_plant_food
+          - entity: button.gardyn_03_grow_log_thinning
+          - entity: button.gardyn_03_grow_log_root_check
+          - entity: button.gardyn_03_grow_log_trim
+          - entity: button.gardyn_03_grow_log_harvest
+          - entity: button.gardyn_03_grow_log_tank_refresh
+
+  - type: grid
+    cards:
+      - type: heading
+        heading: Cameras
+      - type: picture-entity
+        entity: image.gardyn_03_upper_camera
+        name: Upper camera
+        show_state: false
+      - type: picture-entity
+        entity: image.gardyn_03_lower_camera
+        name: Lower camera
+        show_state: false
+```
+
+If the entity IDs differ, open the Gardyn MQTT device in Home Assistant and copy the entity IDs from there. The entity names are stable, but Home Assistant can generate different IDs depending on prior discovery history.
+
+#### Manual MQTT Tests
 
 Light:
 
-```
-mosquitto_pub -t "gardyn/light/command" -m "ON" -u gardyn -P "somepassword"
-mosquitto_pub -t "gardyn/light/command" -m "OFF" -u gardyn -P "somepassword"
+```bash
+mosquitto_pub -h <broker-ip> -t "gardyn/light/command" -m "ON" -u gardyn -P "somepassword"
+mosquitto_pub -h <broker-ip> -t "gardyn/light/brightness/set" -m "70" -u gardyn -P "somepassword"
+mosquitto_pub -h <broker-ip> -t "gardyn/light/command" -m "OFF" -u gardyn -P "somepassword"
 ```
 
 Pump:
 
+```bash
+mosquitto_pub -h <broker-ip> -t "gardyn/pump/command" -m "ON" -u gardyn -P "somepassword"
+mosquitto_pub -h <broker-ip> -t "gardyn/pump/speed/set" -m "100" -u gardyn -P "somepassword"
+mosquitto_pub -h <broker-ip> -t "gardyn/pump/command" -m "OFF" -u gardyn -P "somepassword"
 ```
-mosquitto_pub -t "gardyn/pump/command" -m "ON" -u gardyn -P "somepassword"
-mosquitto_pub -t "gardyn/pump/command" -m "OFF" -u gardyn -P "somepassword"
+
+Water:
+
+```bash
+mosquitto_pub -h <broker-ip> -t "gardyn/water/level/get" -m "" -u gardyn -P "somepassword"
+mosquitto_pub -h <broker-ip> -t "gardyn/water/low/cm/set" -m "11" -u gardyn -P "somepassword"
+mosquitto_sub -h <broker-ip> -t "gardyn/water/#" -v -u gardyn -P "somepassword"
 ```
 
-Sensors:
+Food:
 
-Open two terminals on the gardyn pi, in one run:
+```bash
+mosquitto_pub -h <broker-ip> -t "gardyn/food/last_fed/set" -m "now" -u gardyn -P "somepassword"
+mosquitto_pub -h <broker-ip> -t "gardyn/food/last_fed/set" -m "2026-05-01T12:00:00-06:00" -u gardyn -P "somepassword"
+mosquitto_sub -h <broker-ip> -t "gardyn/food/#" -v -u gardyn -P "somepassword"
+```
 
-`mosquitto_sub -t "gardyn/water/level" -u gardyn -P "somepassword"`
+Grow cycle:
 
-In the second gardyn pi terminal, run:
+```bash
+mosquitto_pub -h <broker-ip> -t "gardyn/grow/start_date/set" -m "now" -u gardyn -P "somepassword"
+mosquitto_pub -h <broker-ip> -t "gardyn/grow/plant_food_started/set" -m "now" -u gardyn -P "somepassword"
+mosquitto_pub -h <broker-ip> -t "gardyn/grow/roots_checked_at/set" -m "now" -u gardyn -P "somepassword"
+mosquitto_sub -h <broker-ip> -t "gardyn/grow/#" -v -u gardyn -P "somepassword"
+```
 
-`mosquitto_pub -t "gardyn/water/level/get" -m ""-r  -u gardyn -P "somepassword"`
+Camera:
 
+```bash
+mosquitto_pub -h <broker-ip> -t "gardyn/image/capture" -m "now" -u gardyn -P "somepassword"
+mosquitto_sub -h <broker-ip> -t "gardyn/image/#" -v -u gardyn -P "somepassword"
 ```
 
 ### Testing
