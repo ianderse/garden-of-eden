@@ -5,10 +5,11 @@ import logging
 import paho.mqtt.client as mqtt
 import base64
 import json
+from datetime import datetime, timezone
 # import picamera
 # import cv2
 from time import sleep
-from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_TOPIC, IDENTIFIER, MODEL, VERSION, WATER_LOW_CM, DISTANCE_SENSOR_ENABLED, UPPER_CAMERA_DEVICE, LOWER_CAMERA_DEVICE, UPPER_IMAGE_PATH, LOWER_IMAGE_PATH, CAMERA_RESOLUTION, IMAGE_INTERVAL_SECONDS
+from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_TOPIC, IDENTIFIER, MODEL, VERSION, WATER_LOW_CM, DISTANCE_SENSOR_ENABLED, WATER_REFILL_AMOUNT, FOOD_INTERVAL_DAYS, FOOD_AMOUNT, FOOD_CHECK_INTERVAL_HOURS, UPPER_CAMERA_DEVICE, LOWER_CAMERA_DEVICE, UPPER_IMAGE_PATH, LOWER_IMAGE_PATH, CAMERA_RESOLUTION, IMAGE_INTERVAL_SECONDS
 
 from gpiozero import Button  # Import gpiozero Button
 from gpiozero.pins.pigpio import PiGPIOFactory
@@ -66,6 +67,8 @@ pump_state = False
 double_press_time = 1  # Time to detect a double press (in seconds)
 press_count = 0
 double_press_timer = None
+food_last_fed = None
+food_last_fed_loaded = threading.Event()
 
 # Button press callbacks
 def toggle_light():
@@ -182,6 +185,35 @@ def update_water_low_state(client):
         # If checking is disabled, maybe set it to OFF by default
         client.publish(BASE_TOPIC + "/water/low/state", "OFF", retain=True)
         logger.info("Water low checking disabled, setting water low state to OFF")
+
+def parse_food_timestamp(payload):
+    if not payload:
+        return None
+    try:
+        timestamp = payload
+        if timestamp.endswith("Z"):
+            timestamp = timestamp[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(timestamp)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+def food_needed_state():
+    if food_last_fed is None:
+        return "ON"
+    elapsed_days = (datetime.now(timezone.utc) - food_last_fed).total_seconds() / (24 * 60 * 60)
+    return "ON" if elapsed_days >= FOOD_INTERVAL_DAYS else "OFF"
+
+def publish_food_needed_state(client):
+    state = food_needed_state()
+    client.publish(BASE_TOPIC + "/food/needed", state, retain=True)
+    logger.info(f"Published food needed state: {state}")
+
+def publish_static_display_values(client):
+    client.publish(BASE_TOPIC + "/water/refill_amount", WATER_REFILL_AMOUNT, retain=True)
+    client.publish(BASE_TOPIC + "/food/amount", FOOD_AMOUNT, retain=True)
 
 # https://www.home-assistant.io/integrations/mqtt/#discovery-messages
 #  Note: homeassistant/<component>/[<node_id>/]<object_id>/config.
@@ -302,6 +334,68 @@ def send_discovery_messages(client):
     }
     client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
 
+    # Config for Water Refill Amount
+    TEMP_CONFIG_TOPIC = f"homeassistant/sensor/gardyn/{IDENTIFIER}_water_refill_amount/config"
+    temp_config_payload = {
+        "name": "Water Refill Amount",
+        "unique_id": IDENTIFIER + "_water_refill_amount",
+        "platform": "mqtt",
+        "state_topic": BASE_TOPIC + "/water/refill_amount",
+        "icon": "mdi:cup-water",
+        "device": device_info
+    }
+    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+
+    # Config for Food Needed Binary Sensor
+    TEMP_CONFIG_TOPIC = f"homeassistant/binary_sensor/gardyn/{IDENTIFIER}_food_needed/config"
+    temp_config_payload = {
+        "name": "Food Needed",
+        "unique_id": IDENTIFIER + "_food_needed",
+        "platform": "mqtt",
+        "state_topic": BASE_TOPIC + "/food/needed",
+        "device_class": "problem",
+        "payload_on": "ON",
+        "payload_off": "OFF",
+        "device": device_info
+    }
+    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+
+    # Config for Last Fed Sensor
+    TEMP_CONFIG_TOPIC = f"homeassistant/sensor/gardyn/{IDENTIFIER}_last_fed/config"
+    temp_config_payload = {
+        "name": "Last Fed",
+        "unique_id": IDENTIFIER + "_last_fed",
+        "platform": "mqtt",
+        "state_topic": BASE_TOPIC + "/food/last_fed",
+        "device_class": "timestamp",
+        "device": device_info
+    }
+    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+
+    # Config for Log Feeding Button
+    TEMP_CONFIG_TOPIC = f"homeassistant/button/gardyn/{IDENTIFIER}_log_feeding/config"
+    temp_config_payload = {
+        "name": "Log Feeding",
+        "unique_id": IDENTIFIER + "_log_feeding",
+        "platform": "mqtt",
+        "command_topic": BASE_TOPIC + "/food/last_fed/set",
+        "payload_press": "now",
+        "device": device_info
+    }
+    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+
+    # Config for Food Amount Sensor
+    TEMP_CONFIG_TOPIC = f"homeassistant/sensor/gardyn/{IDENTIFIER}_food_amount/config"
+    temp_config_payload = {
+        "name": "Food Amount",
+        "unique_id": IDENTIFIER + "_food_amount",
+        "platform": "mqtt",
+        "state_topic": BASE_TOPIC + "/food/amount",
+        "icon": "mdi:food-apple",
+        "device": device_info
+    }
+    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+
     # Config for Water Low Threshold (current value)
         # Config for Water Low CM Set Number
     TEMP_CONFIG_TOPIC = f"homeassistant/number/gardyn/{IDENTIFIER}_water_low_cm/config"
@@ -364,9 +458,10 @@ def on_connect(client, userdata, flags, rc, properties=None):
     # client.subscribe(BASE_TOPIC + "/light/brightness/set")
     send_discovery_messages(client)
     publish_water_low_mode(client)
+    publish_static_display_values(client)
 
 def on_message(client, userdata, msg):
-    global brightness, speed, WATER_LOW_CM
+    global brightness, speed, WATER_LOW_CM, food_last_fed
 
     # Handle binary payloads (like image topics) — skip decoding
     if msg.topic.endswith("/image/upper_camera") or msg.topic.endswith("/image/lower_camera"):
@@ -435,6 +530,29 @@ def on_message(client, userdata, msg):
                 update_water_low_state(client)
             except ValueError:
                 logger.error(f"Invalid water low cm value: {payload}")
+
+        # === Food Notifications ===
+        elif topic_suffix == "food/last_fed":
+            parsed = parse_food_timestamp(payload)
+            if parsed is None:
+                logger.error(f"Invalid retained food last fed timestamp: {payload}")
+                return
+            food_last_fed = parsed
+            food_last_fed_loaded.set()
+            publish_food_needed_state(client)
+
+        elif topic_suffix == "food/last_fed/set":
+            if payload.lower() == "now":
+                food_last_fed = datetime.now(timezone.utc)
+            else:
+                parsed = parse_food_timestamp(payload)
+                if parsed is None:
+                    logger.error(f"Invalid food last fed command payload: {payload}")
+                    return
+                food_last_fed = parsed
+            food_last_fed_loaded.set()
+            client.publish(BASE_TOPIC + "/food/last_fed", food_last_fed.isoformat(), retain=True)
+            publish_food_needed_state(client)
 
         # === Sensor Data on Request ===
         elif topic_suffix == "pcb/temperature/get":
@@ -518,6 +636,12 @@ def capture_images(client):
         client.publish(BASE_TOPIC + "/image/lower_camera", payload=lower_cam_jpeg_data, qos=0, retain=False)
         logger.info("Published image to /image/lower_camera")
 
+def publish_food_needed(client):
+    food_last_fed_loaded.wait(timeout=5)
+    while True:
+        publish_food_needed_state(client)
+        sleep(FOOD_CHECK_INTERVAL_HOURS * 60 * 60)
+
 def publish_images(client):
     while True:
         try:
@@ -555,6 +679,9 @@ if __name__ == "__main__":
     water_level_thread.daemon = True
     water_level_thread.start()
 
+    food_needed_thread = threading.Thread(target=publish_food_needed, args=(client,))
+    food_needed_thread.daemon = True
+    food_needed_thread.start()
 
     publish_images_thread = threading.Thread(target=publish_images, args=(client,))
     publish_images_thread.daemon = True
