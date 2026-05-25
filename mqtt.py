@@ -5,10 +5,11 @@ import logging
 import paho.mqtt.client as mqtt
 import base64
 import json
+from datetime import datetime, timedelta, timezone
 # import picamera
 # import cv2
 from time import sleep
-from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_TOPIC, IDENTIFIER, MODEL, VERSION, WATER_LOW_CM, UPPER_CAMERA_DEVICE, LOWER_CAMERA_DEVICE, UPPER_IMAGE_PATH, LOWER_IMAGE_PATH, CAMERA_RESOLUTION, IMAGE_INTERVAL_SECONDS
+from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_TOPIC, IDENTIFIER, MODEL, VERSION, WATER_LOW_CM, GROW_CHECK_INTERVAL_HOURS, GROW_THIN_DAYS_AFTER_FOOD, GROW_ROOT_FIRST_CHECK_DAYS, GROW_ROOT_CHECK_INTERVAL_DAYS, GROW_TRIM_INTERVAL_DAYS, GROW_HARVEST_FIRST_DAYS, GROW_HARVEST_INTERVAL_DAYS, GROW_TANK_REFRESH_INTERVAL_DAYS, GROW_TANK_REFRESH_WARNING_DAYS, UPPER_CAMERA_DEVICE, LOWER_CAMERA_DEVICE, UPPER_IMAGE_PATH, LOWER_IMAGE_PATH, CAMERA_RESOLUTION, IMAGE_INTERVAL_SECONDS
 
 from gpiozero import Button  # Import gpiozero Button
 from gpiozero.pins.pigpio import PiGPIOFactory
@@ -66,6 +67,25 @@ pump_state = False
 double_press_time = 1  # Time to detect a double press (in seconds)
 press_count = 0
 double_press_timer = None
+grow_state_loaded = threading.Event()
+grow_state = {
+    "start_date": None,
+    "plant_food_started": None,
+    "thinned_at": None,
+    "roots_checked_at": None,
+    "trimmed_at": None,
+    "harvested_at": None,
+    "tank_refreshed_at": None,
+}
+GROW_STATE_TOPICS = {
+    "grow/start_date": "start_date",
+    "grow/plant_food_started": "plant_food_started",
+    "grow/thinned_at": "thinned_at",
+    "grow/roots_checked_at": "roots_checked_at",
+    "grow/trimmed_at": "trimmed_at",
+    "grow/harvested_at": "harvested_at",
+    "grow/tank_refreshed_at": "tank_refreshed_at",
+}
 
 # Button press callbacks
 def toggle_light():
@@ -175,6 +195,118 @@ def update_water_low_state(client):
         # If checking is disabled, maybe set it to OFF by default
         client.publish(BASE_TOPIC + "/water/low/state", "OFF", retain=True)
         logger.info("Water low checking disabled, setting water low state to OFF")
+
+def parse_grow_timestamp(payload):
+    if not payload:
+        return None
+    try:
+        timestamp = payload
+        if timestamp.endswith("Z"):
+            timestamp = timestamp[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(timestamp)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+def grow_day(now):
+    start_date = grow_state["start_date"]
+    if start_date is None:
+        return 0
+    return max(1, (now.date() - start_date.date()).days + 1)
+
+def is_due_since(timestamp, days, now):
+    return timestamp is not None and now - timestamp >= timedelta(days=days)
+
+def grow_task_states(now=None):
+    now = now or datetime.now(timezone.utc)
+    start_date = grow_state["start_date"]
+    plant_food_started = grow_state["plant_food_started"]
+    tank_refresh_anchor = grow_state["tank_refreshed_at"] or start_date
+
+    thin_needed = False
+    if plant_food_started is not None:
+        thin_logged_after_food = (
+            grow_state["thinned_at"] is not None
+            and grow_state["thinned_at"] >= plant_food_started
+        )
+        thin_needed = not thin_logged_after_food and is_due_since(
+            plant_food_started,
+            GROW_THIN_DAYS_AFTER_FOOD,
+            now
+        )
+
+    roots_anchor = grow_state["roots_checked_at"]
+    if roots_anchor is None:
+        roots_needed = is_due_since(start_date, GROW_ROOT_FIRST_CHECK_DAYS, now)
+    else:
+        roots_needed = is_due_since(roots_anchor, GROW_ROOT_CHECK_INTERVAL_DAYS, now)
+
+    trim_anchor = grow_state["trimmed_at"] or start_date
+    trim_needed = is_due_since(trim_anchor, GROW_TRIM_INTERVAL_DAYS, now)
+
+    harvest_anchor = grow_state["harvested_at"]
+    if harvest_anchor is None:
+        harvest_needed = is_due_since(start_date, GROW_HARVEST_FIRST_DAYS, now)
+    else:
+        harvest_needed = is_due_since(harvest_anchor, GROW_HARVEST_INTERVAL_DAYS, now)
+
+    tank_refresh_needed = False
+    tank_refresh_status = "OK"
+    if tank_refresh_anchor is not None:
+        tank_refresh_due_at = tank_refresh_anchor + timedelta(days=GROW_TANK_REFRESH_INTERVAL_DAYS)
+        if now >= tank_refresh_due_at:
+            tank_refresh_needed = True
+            tank_refresh_status = "DUE"
+        elif tank_refresh_due_at - now <= timedelta(days=GROW_TANK_REFRESH_WARNING_DAYS):
+            tank_refresh_status = "SOON"
+
+    next_task = "None"
+    if start_date is None:
+        next_task = "Start grow cycle"
+    elif tank_refresh_needed:
+        next_task = "Refresh tank"
+    elif thin_needed:
+        next_task = "Thin sprouts"
+    elif roots_needed:
+        next_task = "Check roots"
+    elif trim_needed:
+        next_task = "Trim plants"
+    elif harvest_needed:
+        next_task = "Harvest"
+    elif tank_refresh_status == "SOON":
+        next_task = "Refresh tank soon"
+
+    return {
+        "day": grow_day(now),
+        "thin_needed": thin_needed,
+        "roots_check_needed": roots_needed,
+        "trim_needed": trim_needed,
+        "harvest_needed": harvest_needed,
+        "tank_refresh_needed": tank_refresh_needed,
+        "tank_refresh_status": tank_refresh_status,
+        "next_task": next_task,
+    }
+
+def publish_grow_tasks(client):
+    states = grow_task_states()
+    client.publish(BASE_TOPIC + "/grow/day", str(states["day"]), retain=True)
+    client.publish(BASE_TOPIC + "/grow/thin_needed", "ON" if states["thin_needed"] else "OFF", retain=True)
+    client.publish(BASE_TOPIC + "/grow/roots_check_needed", "ON" if states["roots_check_needed"] else "OFF", retain=True)
+    client.publish(BASE_TOPIC + "/grow/trim_needed", "ON" if states["trim_needed"] else "OFF", retain=True)
+    client.publish(BASE_TOPIC + "/grow/harvest_needed", "ON" if states["harvest_needed"] else "OFF", retain=True)
+    client.publish(BASE_TOPIC + "/grow/tank_refresh_needed", "ON" if states["tank_refresh_needed"] else "OFF", retain=True)
+    client.publish(BASE_TOPIC + "/grow/tank_refresh_status", states["tank_refresh_status"], retain=True)
+    client.publish(BASE_TOPIC + "/grow/next_task", states["next_task"], retain=True)
+    logger.info(f"Published grow task states: {states}")
+
+def clear_grow_task_logs(client):
+    for state_topic, state_key in GROW_STATE_TOPICS.items():
+        if state_key == "start_date":
+            continue
+        grow_state[state_key] = None
+        client.publish(BASE_TOPIC + "/" + state_topic, payload=None, retain=True)
 
 # https://www.home-assistant.io/integrations/mqtt/#discovery-messages
 #  Note: homeassistant/<component>/[<node_id>/]<object_id>/config.
@@ -294,6 +426,75 @@ def send_discovery_messages(client):
         "device": device_info
     }
     client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+
+    def publish_sensor_config(object_id, name, state_topic, device_class=None, unit=None, icon=None):
+        temp_config_topic = f"homeassistant/sensor/gardyn/{IDENTIFIER}_{object_id}/config"
+        temp_config_payload = {
+            "name": name,
+            "unique_id": IDENTIFIER + "_" + object_id,
+            "platform": "mqtt",
+            "state_topic": BASE_TOPIC + state_topic,
+            "device": device_info
+        }
+        if device_class:
+            temp_config_payload["device_class"] = device_class
+        if unit:
+            temp_config_payload["unit_of_measurement"] = unit
+        if icon:
+            temp_config_payload["icon"] = icon
+        client.publish(temp_config_topic, json.dumps(temp_config_payload), retain=True)
+
+    def publish_binary_sensor_config(object_id, name, state_topic):
+        temp_config_topic = f"homeassistant/binary_sensor/gardyn/{IDENTIFIER}_{object_id}/config"
+        temp_config_payload = {
+            "name": name,
+            "unique_id": IDENTIFIER + "_" + object_id,
+            "platform": "mqtt",
+            "state_topic": BASE_TOPIC + state_topic,
+            "device_class": "problem",
+            "payload_on": "ON",
+            "payload_off": "OFF",
+            "device": device_info
+        }
+        client.publish(temp_config_topic, json.dumps(temp_config_payload), retain=True)
+
+    def publish_button_config(object_id, name, command_topic):
+        temp_config_topic = f"homeassistant/button/gardyn/{IDENTIFIER}_{object_id}/config"
+        temp_config_payload = {
+            "name": name,
+            "unique_id": IDENTIFIER + "_" + object_id,
+            "platform": "mqtt",
+            "command_topic": BASE_TOPIC + command_topic,
+            "payload_press": "now",
+            "device": device_info
+        }
+        client.publish(temp_config_topic, json.dumps(temp_config_payload), retain=True)
+
+    publish_sensor_config("grow_day", "Grow Day", "/grow/day", unit="d", icon="mdi:sprout")
+    publish_sensor_config("grow_next_task", "Next Grow Task", "/grow/next_task", icon="mdi:clipboard-list-outline")
+    publish_sensor_config("grow_tank_refresh_status", "Tank Refresh Status", "/grow/tank_refresh_status", icon="mdi:water-sync")
+
+    publish_sensor_config("grow_start_date", "Grow Cycle Start", "/grow/start_date", device_class="timestamp")
+    publish_sensor_config("grow_plant_food_started", "Plant Food Started", "/grow/plant_food_started", device_class="timestamp")
+    publish_sensor_config("grow_thinned_at", "Last Thinned", "/grow/thinned_at", device_class="timestamp")
+    publish_sensor_config("grow_roots_checked_at", "Last Root Check", "/grow/roots_checked_at", device_class="timestamp")
+    publish_sensor_config("grow_trimmed_at", "Last Trim", "/grow/trimmed_at", device_class="timestamp")
+    publish_sensor_config("grow_harvested_at", "Last Harvest", "/grow/harvested_at", device_class="timestamp")
+    publish_sensor_config("grow_tank_refreshed_at", "Last Tank Refresh", "/grow/tank_refreshed_at", device_class="timestamp")
+
+    publish_binary_sensor_config("grow_thin_needed", "Thin Needed", "/grow/thin_needed")
+    publish_binary_sensor_config("grow_roots_check_needed", "Roots Check Needed", "/grow/roots_check_needed")
+    publish_binary_sensor_config("grow_trim_needed", "Trim Needed", "/grow/trim_needed")
+    publish_binary_sensor_config("grow_harvest_needed", "Harvest Needed", "/grow/harvest_needed")
+    publish_binary_sensor_config("grow_tank_refresh_needed", "Tank Refresh Needed", "/grow/tank_refresh_needed")
+
+    publish_button_config("grow_start_cycle", "Start Grow Cycle", "/grow/start_date/set")
+    publish_button_config("grow_log_plant_food", "Log Plant Food Started", "/grow/plant_food_started/set")
+    publish_button_config("grow_log_thinning", "Log Thinning", "/grow/thinned_at/set")
+    publish_button_config("grow_log_root_check", "Log Root Check", "/grow/roots_checked_at/set")
+    publish_button_config("grow_log_trim", "Log Trim", "/grow/trimmed_at/set")
+    publish_button_config("grow_log_harvest", "Log Harvest", "/grow/harvested_at/set")
+    publish_button_config("grow_log_tank_refresh", "Log Tank Refresh", "/grow/tank_refreshed_at/set")
 
     # Config for Water Low Threshold (current value)
         # Config for Water Low CM Set Number
@@ -428,6 +629,46 @@ def on_message(client, userdata, msg):
             except ValueError:
                 logger.error(f"Invalid water low cm value: {payload}")
 
+        # === Grow Cycle Tasks ===
+        elif topic_suffix in GROW_STATE_TOPICS:
+            state_key = GROW_STATE_TOPICS[topic_suffix]
+            if payload == "":
+                grow_state[state_key] = None
+                grow_state_loaded.set()
+                publish_grow_tasks(client)
+                return
+            parsed = parse_grow_timestamp(payload)
+            if parsed is None:
+                logger.error(f"Invalid retained grow timestamp on {msg.topic}: {payload}")
+                return
+            grow_state[state_key] = parsed
+            grow_state_loaded.set()
+            publish_grow_tasks(client)
+
+        elif topic_suffix.endswith("/set") and topic_suffix[:-4] in GROW_STATE_TOPICS:
+            state_topic = topic_suffix[:-4]
+            state_key = GROW_STATE_TOPICS[state_topic]
+            if payload.lower() in ("", "clear", "none"):
+                grow_state[state_key] = None
+                grow_state_loaded.set()
+                client.publish(BASE_TOPIC + "/" + state_topic, payload=None, retain=True)
+                publish_grow_tasks(client)
+                return
+            elif payload.lower() == "now":
+                logged_at = datetime.now(timezone.utc)
+            else:
+                parsed = parse_grow_timestamp(payload)
+                if parsed is None:
+                    logger.error(f"Invalid grow command payload on {msg.topic}: {payload}")
+                    return
+                logged_at = parsed
+            grow_state[state_key] = logged_at
+            grow_state_loaded.set()
+            client.publish(BASE_TOPIC + "/" + state_topic, logged_at.isoformat(), retain=True)
+            if state_key == "start_date":
+                clear_grow_task_logs(client)
+            publish_grow_tasks(client)
+
         # === Sensor Data on Request ===
         elif topic_suffix == "pcb/temperature/get":
             pcb_temp = get_pcb_temperature()
@@ -481,6 +722,12 @@ def publish_water_level(client):
             logger.info(f"Publishing Water Level: {distance:.2f}cm")
             client.publish(BASE_TOPIC + "/water/level", f"{distance:.2f}")
         sleep(30 * 60)
+
+def publish_grow_cycle(client):
+    grow_state_loaded.wait(timeout=5)
+    while True:
+        publish_grow_tasks(client)
+        sleep(GROW_CHECK_INTERVAL_HOURS * 60 * 60)
 
 def publish_images(client):
     while True:
@@ -543,6 +790,9 @@ if __name__ == "__main__":
     water_level_thread.daemon = True
     water_level_thread.start()
 
+    grow_cycle_thread = threading.Thread(target=publish_grow_cycle, args=(client,))
+    grow_cycle_thread.daemon = True
+    grow_cycle_thread.start()
 
     publish_images_thread = threading.Thread(target=publish_images, args=(client,))
     publish_images_thread.daemon = True
