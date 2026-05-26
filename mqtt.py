@@ -42,6 +42,7 @@ distance_sensor = None
 button = None
 client = None
 capture_lock = threading.Lock()
+distance_measure_lock = threading.Lock()
 
 # default on brightness
 brightness  = 50
@@ -172,6 +173,9 @@ def flash_lights(times=3, delay=0.3):
 
 def safe_distance_measure():
     global distance_sensor
+    if not distance_measure_lock.acquire(blocking=False):
+        logger.warning("Distance measure already in progress, skipping request")
+        return None
     try:
         return get_distance_sensor().measure_once()
     except MeasurementError as e:
@@ -179,11 +183,13 @@ def safe_distance_measure():
         try:
             if distance_sensor is not None:
                 distance_sensor.cleanup()
-            distance_sensor = Distance(pin_factory=pin_factory)
+            distance_sensor = Distance(pin_factory=get_pin_factory())
             return distance_sensor.measure_once()
         except Exception as e2:
             logger.error(f"Distance full recovery failed: {e2}")
             return None
+    finally:
+        distance_measure_lock.release()
 
 def parse_percentage(payload, label):
     try:
