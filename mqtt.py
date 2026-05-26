@@ -46,6 +46,8 @@ capture_lock = threading.Lock()
 # default on brightness
 brightness  = 50
 speed       = 100
+DEFAULT_BRIGHTNESS = 50
+DEFAULT_SPEED = 100
 sec_per_min = 60
 min_per_hr  = 60
 
@@ -432,9 +434,12 @@ def on_message(client, userdata, msg):
                         return
                     else:
                         client.publish(BASE_TOPIC + "/water/low/state", "OFF", retain=True)
+                if speed <= 0:
+                    speed = DEFAULT_SPEED
                 get_pump().set_speed(speed)
                 pump_state = True
                 client.publish(BASE_TOPIC + "/pump/state", "ON")
+                client.publish(BASE_TOPIC + "/pump/speed/state", str(speed))
             elif payload.upper() == "OFF":
                 get_pump().off()
                 pump_state = False
@@ -445,15 +450,25 @@ def on_message(client, userdata, msg):
             if parsed_speed is None:
                 return
             speed = parsed_speed
-            get_pump().set_speed(speed)
+            if speed == 0:
+                get_pump().off()
+                pump_state = False
+                client.publish(BASE_TOPIC + "/pump/state", "OFF")
+            else:
+                get_pump().set_speed(speed)
+                pump_state = True
+                client.publish(BASE_TOPIC + "/pump/state", "ON")
             client.publish(BASE_TOPIC + "/pump/speed/state", str(speed))
 
         # === Light Logic ===
         elif topic_suffix == "light/command":
             if payload.upper() == "ON":
+                if brightness <= 0:
+                    brightness = DEFAULT_BRIGHTNESS
                 get_light().set_duty_cycle(brightness)
                 light_state = True
                 client.publish(BASE_TOPIC + "/light/state", "ON")
+                client.publish(BASE_TOPIC + "/light/brightness/state", str(brightness))
             elif payload.upper() == "OFF":
                 get_light().off()
                 light_state = False
@@ -464,7 +479,14 @@ def on_message(client, userdata, msg):
             if parsed_brightness is None:
                 return
             brightness = parsed_brightness
-            get_light().set_duty_cycle(brightness)
+            if brightness == 0:
+                get_light().off()
+                light_state = False
+                client.publish(BASE_TOPIC + "/light/state", "OFF")
+            else:
+                get_light().set_duty_cycle(brightness)
+                light_state = True
+                client.publish(BASE_TOPIC + "/light/state", "ON")
             client.publish(BASE_TOPIC + "/light/brightness/state", str(brightness))
 
         # === Water Level ===
