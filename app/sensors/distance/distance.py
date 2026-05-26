@@ -18,7 +18,7 @@ class Distance:
         echo_pin (int): GPIO pin used to receive the echo pulse.
     """
 
-    def __init__(self, pin_factory=None, trigger_pin=19, echo_pin=26, timeout=0.08):
+    def __init__(self, pin_factory=None, trigger_pin=26, echo_pin=19, timeout=0.08):
         """
         Initializes the ultrasonic distance sensor pins.
 

@@ -17,8 +17,8 @@ class TestDistance(unittest.TestCase):
 
         def trigger_echo(trigger_pin, pulse_len, level):
             echo_callback = self.mock_pi.callback.call_args.args[2]
-            echo_callback(26, 1, 1000)
-            echo_callback(26, 0, 3915)
+            echo_callback(19, 1, 1000)
+            echo_callback(19, 0, 3915)
 
         self.mock_pi.gpio_trigger.side_effect = trigger_echo
         self.distance = Distance()
@@ -31,10 +31,10 @@ class TestDistance(unittest.TestCase):
         measured_distance = self.distance.measure_once()
         self.assertEqual(measured_distance, 49.99)
 
-    def test_uses_documented_gpio_pins(self):
-        self.mock_pi.set_mode.assert_any_call(19, 1)
-        self.mock_pi.set_mode.assert_any_call(26, 0)
-        self.mock_pi.set_pull_up_down.assert_called_with(26, 1)
+    def test_uses_upstream_wiring_diagram_gpio_pins(self):
+        self.mock_pi.set_mode.assert_any_call(26, 1)
+        self.mock_pi.set_mode.assert_any_call(19, 0)
+        self.mock_pi.set_pull_up_down.assert_called_with(19, 1)
 
     def test_median_odd_length(self):
         data = [1, 2, 3, 4, 5]
