@@ -237,6 +237,22 @@ def publish_water_low_mode(client):
     logger.info(f"Publishing water low mode: {mode}")
     client.publish(BASE_TOPIC + "/water/low/mode", mode, retain=True)
 
+def publish_water_low_threshold(client):
+    threshold = WATER_LOW_CM if WATER_LOW_CM is not None else 0
+    logger.info(f"Publishing water low threshold: {threshold:.2f}cm")
+    client.publish(BASE_TOPIC + "/water/low/cm", f"{threshold:.2f}", retain=True)
+
+def publish_water_measurement(client, distance):
+    logger.info(f"Publishing Water Level: {distance:.2f}cm")
+    client.publish(BASE_TOPIC + "/water/level", f"{distance:.2f}", retain=True)
+    if DISTANCE_SENSOR_ENABLED and WATER_LOW_CM not in (None, 0):
+        if distance > WATER_LOW_CM:
+            client.publish(BASE_TOPIC + "/water/low/state", "ON", retain=True)
+            logger.info(f"Updated water low state to ON (distance {distance:.2f}cm > {WATER_LOW_CM:.2f}cm)")
+        else:
+            client.publish(BASE_TOPIC + "/water/low/state", "OFF", retain=True)
+            logger.info(f"Updated water low state to OFF (distance {distance:.2f}cm <= {WATER_LOW_CM:.2f}cm)")
+
 
 def update_water_low_state(client):
     if not DISTANCE_SENSOR_ENABLED:
@@ -247,12 +263,7 @@ def update_water_low_state(client):
     if WATER_LOW_CM not in (None, 0):
         distance = safe_distance_measure()
         if distance is not None:
-            if distance > WATER_LOW_CM:
-                client.publish(BASE_TOPIC + "/water/low/state", "ON", retain=True)
-                logger.info(f"Updated water low state to ON (distance {distance:.2f}cm > {WATER_LOW_CM:.2f}cm)")
-            else:
-                client.publish(BASE_TOPIC + "/water/low/state", "OFF", retain=True)
-                logger.info(f"Updated water low state to OFF (distance {distance:.2f}cm <= {WATER_LOW_CM:.2f}cm)")
+            publish_water_measurement(client, distance)
         else:
             logger.warning("Could not update water low state because distance reading failed")
     else:
@@ -713,6 +724,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
     # client.subscribe(BASE_TOPIC + "/light/brightness/set")
     send_discovery_messages(client)
     publish_water_low_mode(client)
+    publish_water_low_threshold(client)
     publish_static_display_values(client)
 
 def on_message(client, userdata, msg):
@@ -805,12 +817,12 @@ def on_message(client, userdata, msg):
             if DISTANCE_SENSOR_ENABLED:
                 distance = safe_distance_measure()
                 if distance is not None:
-                    client.publish(BASE_TOPIC + "/water/level", f"{distance:.2f}")
+                    publish_water_measurement(client, distance)
 
         elif topic_suffix == "water/low/cm/set":
             try:
                 WATER_LOW_CM = float(payload)
-                client.publish(BASE_TOPIC + "/water/low/cm", f"{WATER_LOW_CM:.2f}", retain=True)
+                publish_water_low_threshold(client)
                 publish_water_low_mode(client)
                 update_water_low_state(client)
             except ValueError:
@@ -946,8 +958,7 @@ def publish_water_level(client):
     while True:
         distance = safe_distance_measure()
         if distance is not None:
-            logger.info(f"Publishing Water Level: {distance:.2f}cm")
-            client.publish(BASE_TOPIC + "/water/level", f"{distance:.2f}")
+            publish_water_measurement(client, distance)
         sleep(30 * 60)
 
 def capture_images(client):
