@@ -83,5 +83,11 @@ class TestDistance(unittest.TestCase):
         with self.assertRaises(MeasurementError):
             distance.measure_once()
 
+    @patch('app.sensors.distance.distance.Distance.measure_once', autospec=True)
+    def test_measure_reports_last_sample_error(self, mock_measure_once):
+        mock_measure_once.side_effect = MeasurementError("No echo received")
+        with self.assertRaisesRegex(MeasurementError, "No successful measurements: No echo received"):
+            self.distance.measure()
+
 if __name__ == "__main__":
     unittest.main()

@@ -101,14 +101,16 @@ class Distance:
             MeasurementError: If no successful measurements are obtained.
         """
         measurements = []
+        last_error = None
         for _ in range(10):
             try:
                 measurement = self.measure_once()
                 measurements.append(measurement)
-            except MeasurementError:
-                pass  # Handle individual measurement errors gracefully
+            except MeasurementError as e:
+                last_error = e
         if not measurements:
-            raise MeasurementError("No successful measurements")
+            detail = f": {last_error}" if last_error else ""
+            raise MeasurementError(f"No successful measurements{detail}")
         median_value = self.median(measurements)
         return round(sum(median_value) / len(median_value), 2)
 
