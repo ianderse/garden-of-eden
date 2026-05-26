@@ -47,10 +47,13 @@ pin_factory = PiGPIOFactory()
 pump = Pump(pin_factory=pin_factory)
 light = Light(pin_factory=pin_factory)
 distance_sensor = Distance(pin_factory=pin_factory)
+distance_measure_lock = threading.Lock()
 
 # default on brightness
 brightness  = 50
 speed       = 100
+DEFAULT_BRIGHTNESS = 50
+DEFAULT_SPEED = 100
 sec_per_min = 60
 min_per_hr  = 60
 
@@ -142,6 +145,9 @@ def flash_lights(times=3, delay=0.3):
 
 def safe_distance_measure():
     global distance_sensor
+    if not distance_measure_lock.acquire(blocking=False):
+        logger.warning("Distance measure already in progress, skipping request")
+        return None
     try:
         return distance_sensor.measure_once()
     except MeasurementError as e:
@@ -152,6 +158,19 @@ def safe_distance_measure():
         except Exception as e2:
             logger.error(f"Distance full recovery failed: {e2}")
             return None
+    finally:
+        distance_measure_lock.release()
+
+def parse_percentage(payload, label):
+    try:
+        value = int(payload)
+    except (TypeError, ValueError):
+        logger.error(f"Invalid {label} value: {payload}")
+        return None
+    if not 0 <= value <= 100:
+        logger.error(f"{label} must be between 0 and 100: {value}")
+        return None
+    return value
 
 def publish_water_low_mode(client):
     if WATER_LOW_CM not in (None, 0):
@@ -483,29 +502,51 @@ def on_message(client, userdata, msg):
                         return
                     else:
                         client.publish(BASE_TOPIC + "/water/low/state", "OFF", retain=True)
+                if speed <= 0:
+                    speed = DEFAULT_SPEED
                 pump.set_speed(speed)
                 client.publish(BASE_TOPIC + "/pump/state", "ON")
+                client.publish(BASE_TOPIC + "/pump/speed/state", str(speed))
             elif payload.upper() == "OFF":
                 pump.off()
                 client.publish(BASE_TOPIC + "/pump/state", "OFF")
 
-        elif topic_suffix == "pump/speed/set" and payload.isdigit():
-            speed = int(payload)
-            pump.set_speed(speed)
+        elif topic_suffix == "pump/speed/set":
+            parsed_speed = parse_percentage(payload, "pump speed")
+            if parsed_speed is None:
+                return
+            speed = parsed_speed
+            if speed == 0:
+                pump.off()
+                client.publish(BASE_TOPIC + "/pump/state", "OFF")
+            else:
+                pump.set_speed(speed)
+                client.publish(BASE_TOPIC + "/pump/state", "ON")
             client.publish(BASE_TOPIC + "/pump/speed/state", str(speed))
 
         # === Light Logic ===
         elif topic_suffix == "light/command":
             if payload.upper() == "ON":
+                if brightness <= 0:
+                    brightness = DEFAULT_BRIGHTNESS
                 light.set_duty_cycle(brightness)
                 client.publish(BASE_TOPIC + "/light/state", "ON")
+                client.publish(BASE_TOPIC + "/light/brightness/state", str(brightness))
             elif payload.upper() == "OFF":
                 light.off()
                 client.publish(BASE_TOPIC + "/light/state", "OFF")
 
-        elif topic_suffix == "light/brightness/set" and payload.isdigit():
-            brightness = int(payload)
-            light.set_duty_cycle(brightness)
+        elif topic_suffix == "light/brightness/set":
+            parsed_brightness = parse_percentage(payload, "light brightness")
+            if parsed_brightness is None:
+                return
+            brightness = parsed_brightness
+            if brightness == 0:
+                light.off()
+                client.publish(BASE_TOPIC + "/light/state", "OFF")
+            else:
+                light.set_duty_cycle(brightness)
+                client.publish(BASE_TOPIC + "/light/state", "ON")
             client.publish(BASE_TOPIC + "/light/brightness/state", str(brightness))
 
         # === Water Level ===
