@@ -33,7 +33,7 @@ class Distance:
         self.owns_pin_factory = pin_factory is None
         self.pin_factory = pin_factory if pin_factory else PiGPIOFactory()
         try:
-            self.sensor = DistanceSensor(echo=19, trigger=26, pin_factory=self.pin_factory)
+            self.sensor = DistanceSensor(echo=26, trigger=19, pin_factory=self.pin_factory)
         except Exception as e:
             raise MeasurementError(f"Failed to initialize DistanceSensor: {e}")
 

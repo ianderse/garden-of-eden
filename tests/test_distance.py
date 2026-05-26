@@ -24,6 +24,16 @@ class TestDistance(unittest.TestCase):
         measured_distance = self.distance.measure_once()
         self.assertAlmostEqual(measured_distance, 50.00)
 
+    @patch('app.sensors.distance.distance.PiGPIOFactory')
+    @patch('app.sensors.distance.distance.DistanceSensor', autospec=True)
+    def test_uses_documented_gpio_pins(self, MockDistanceSensor, MockPiGPIOFactory):
+        Distance()
+        MockDistanceSensor.assert_called_with(
+            echo=26,
+            trigger=19,
+            pin_factory=MockPiGPIOFactory.return_value,
+        )
+
     def test_median_odd_length(self):
         data = [1, 2, 3, 4, 5]
         median_value = self.distance.median(data)
