@@ -1,8 +1,6 @@
-# distance.py
+import time
 
-from gpiozero import DistanceSensor
-from gpiozero.pins.pigpio import PiGPIOFactory
-from time import sleep
+import pigpio
 
 class MeasurementError(Exception):
     """
@@ -13,29 +11,41 @@ class MeasurementError(Exception):
 
 class Distance:
     """
-    Class to handle distance measurements using the Raspberry Pi GPIO with gpiozero.
+    Class to handle ultrasonic distance measurements using pigpio timing.
 
     Attributes:
-        sensor (DistanceSensor): The DistanceSensor object for distance measurements.
-        pin_factory (PiGPIOFactory): The factory for GPIO pin configuration.
+        trigger_pin (int): GPIO pin used to trigger a measurement.
+        echo_pin (int): GPIO pin used to receive the echo pulse.
     """
 
-    def __init__(self, pin_factory=None):
+    def __init__(self, pin_factory=None, trigger_pin=19, echo_pin=26, timeout=0.08):
         """
-        Initializes the DistanceSensor object with the specified or default pin factory.
+        Initializes the ultrasonic distance sensor pins.
 
         Args:
-            pin_factory (PiGPIOFactory, optional): A custom pin factory for GPIO configuration. Defaults to PiGPIOFactory.
+            pin_factory: Accepted for compatibility with callers that share a gpiozero factory.
+            trigger_pin (int): GPIO pin used to trigger a measurement.
+            echo_pin (int): GPIO pin used to receive the echo pulse.
+            timeout (float): Seconds to wait for an echo pulse.
 
         Raises:
-            MeasurementError: If the DistanceSensor fails to initialize.
+            MeasurementError: If pigpio is unavailable or pins cannot be configured.
         """
-        self.owns_pin_factory = pin_factory is None
-        self.pin_factory = pin_factory if pin_factory else PiGPIOFactory()
+        self.pin_factory = pin_factory
+        self.trigger_pin = trigger_pin
+        self.echo_pin = echo_pin
+        self.timeout = timeout
+        self.pi = pigpio.pi()
+        if not self.pi.connected:
+            raise MeasurementError("Failed to connect to pigpiod daemon. Ensure it's running.")
         try:
-            self.sensor = DistanceSensor(echo=26, trigger=19, pin_factory=self.pin_factory)
+            self.pi.set_mode(self.trigger_pin, pigpio.OUTPUT)
+            self.pi.write(self.trigger_pin, 0)
+            self.pi.set_mode(self.echo_pin, pigpio.INPUT)
+            self.pi.set_pull_up_down(self.echo_pin, pigpio.PUD_DOWN)
         except Exception as e:
-            raise MeasurementError(f"Failed to initialize DistanceSensor: {e}")
+            self.pi.stop()
+            raise MeasurementError(f"Failed to initialize Distance sensor pins: {e}")
 
     def measure_once(self):
         """
@@ -47,11 +57,38 @@ class Distance:
         Raises:
             MeasurementError: If the measurement fails.
         """
+        pulse = {"rise": None, "fall": None}
+
+        def echo_callback(gpio, level, tick):
+            if level == 1:
+                pulse["rise"] = tick
+            elif level == 0 and pulse["rise"] is not None and pulse["fall"] is None:
+                pulse["fall"] = tick
+
+        callback = self.pi.callback(self.echo_pin, pigpio.EITHER_EDGE, echo_callback)
         try:
-            distance = self.sensor.distance * 100  # Convert to cm
+            self.pi.gpio_trigger(self.trigger_pin, 10, 1)
+            deadline = time.monotonic() + self.timeout
+            while pulse["fall"] is None and time.monotonic() < deadline:
+                time.sleep(0.001)
+
+            if pulse["rise"] is None or pulse["fall"] is None:
+                raise MeasurementError(
+                    f"No echo received on GPIO{self.echo_pin} after triggering GPIO{self.trigger_pin}"
+                )
+
+            pulse_us = pigpio.tickDiff(pulse["rise"], pulse["fall"])
+            if pulse_us <= 0:
+                raise MeasurementError(f"Invalid echo pulse width: {pulse_us}us")
+
+            distance = pulse_us * 0.0343 / 2
             return round(distance, 2)
         except Exception as e:
+            if isinstance(e, MeasurementError):
+                raise
             raise MeasurementError(f"Measurement failed: {e}")
+        finally:
+            callback.cancel()
 
     def measure(self):
         """
@@ -103,10 +140,9 @@ class Distance:
         Properly closes the sensor and pin factory connections.
         """
         try:
-            if hasattr(self, 'sensor') and self.sensor:
-                self.sensor.close()
-            if self.owns_pin_factory and hasattr(self, 'pin_factory') and self.pin_factory:
-                self.pin_factory.close()
+            if hasattr(self, 'pi') and self.pi and self.pi.connected:
+                self.pi.write(self.trigger_pin, 0)
+                self.pi.stop()
         except Exception as e:
             print(f"Warning during cleanup: {e}")
 
