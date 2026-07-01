@@ -3,7 +3,6 @@ import threading
 from threading import Timer
 import logging
 import paho.mqtt.client as mqtt
-import base64
 import json
 from datetime import datetime, timedelta, timezone
 # import picamera
@@ -59,6 +58,8 @@ publish_frequency = sec_per_min * min_per_hr / 2
 # Variables to track the state of the light and pump
 light_state = False
 pump_state = False
+MAX_PUMP_RUNTIME_SECONDS = 7 * 60
+pump_watchdog_timer = None
 double_press_time = 1  # Time to detect a double press (in seconds)
 press_count = 0
 double_press_timer = None
@@ -125,19 +126,49 @@ def initialize_devices():
     configure_button_handlers()
 
 # Button press callbacks
+def publish_light_state(retain=True):
+    if client is None:
+        return
+    client.publish(BASE_TOPIC + "/light/state", "ON" if light_state else "OFF", retain=retain)
+    client.publish(BASE_TOPIC + "/light/brightness/state", str(brightness), retain=retain)
+
+def publish_pump_state(retain=True):
+    if client is None:
+        return
+    client.publish(BASE_TOPIC + "/pump/state", "ON" if pump_state else "OFF", retain=retain)
+    client.publish(BASE_TOPIC + "/pump/speed/state", str(speed), retain=retain)
+
+def force_pump_off():
+    global pump_state
+    logger.warning("Pump watchdog forced pump OFF")
+    get_pump().off()
+    pump_state = False
+    publish_pump_state(retain=True)
+
+def arm_pump_watchdog():
+    global pump_watchdog_timer
+    if pump_watchdog_timer:
+        pump_watchdog_timer.cancel()
+    pump_watchdog_timer = Timer(MAX_PUMP_RUNTIME_SECONDS, force_pump_off)
+    pump_watchdog_timer.daemon = True
+    pump_watchdog_timer.start()
+
+def cancel_pump_watchdog():
+    global pump_watchdog_timer
+    if pump_watchdog_timer:
+        pump_watchdog_timer.cancel()
+        pump_watchdog_timer = None
+
 def toggle_light():
     global light_state
     light_state = not light_state
     if light_state:
         logger.info("Toggling Light ON")
         get_light().set_duty_cycle(brightness)
-        if client is not None:
-            client.publish(BASE_TOPIC + "/light/state", "ON")
     else:
         logger.info("Toggling Light OFF")
         get_light().off()
-        if client is not None:
-            client.publish(BASE_TOPIC + "/light/state", "OFF")
+    publish_light_state(retain=True)
 
 def toggle_pump():
     global pump_state
@@ -145,13 +176,12 @@ def toggle_pump():
     if pump_state:
         logger.info("Toggling Pump ON")
         get_pump().set_speed(speed)
-        if client is not None:
-            client.publish(BASE_TOPIC + "/pump/state", "ON")
+        arm_pump_watchdog()
     else:
         logger.info("Toggling Pump OFF")
         get_pump().off()
-        if client is not None:
-            client.publish(BASE_TOPIC + "/pump/state", "OFF")
+        cancel_pump_watchdog()
+    publish_pump_state(retain=True)
 
 def handle_button_press():
     global press_count, double_press_timer
@@ -698,7 +728,6 @@ def send_discovery_messages(client):
         "name": "Upper Camera",
         "unique_id": IDENTIFIER + "_upper_camera",
         "image_topic": BASE_TOPIC + "/image/upper_camera",
-        "encoding": "b64",
         "content_type": "image/jpeg",
         "object_id": IDENTIFIER + "_upper_camera",
         "device": device_info
@@ -711,21 +740,26 @@ def send_discovery_messages(client):
         "name": "Lower Camera",
         "unique_id": IDENTIFIER + "_lower_camera",
         "image_topic": BASE_TOPIC + "/image/lower_camera",
-        "encoding": "b64",
         "content_type": "image/jpeg",
         "object_id": IDENTIFIER + "_lower_camera",
         "device": device_info
     }
     client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
 
-def on_connect(client, userdata, flags, rc, properties=None):
-    logger.info(f"Connected with result code {rc}")
-    client.subscribe(BASE_TOPIC + "/#")
-    # client.subscribe(BASE_TOPIC + "/light/brightness/set")
-    send_discovery_messages(client)
+def republish_runtime_state(client):
+    publish_light_state(retain=True)
+    publish_pump_state(retain=True)
     publish_water_low_mode(client)
     publish_water_low_threshold(client)
     publish_static_display_values(client)
+
+def on_connect(client, userdata, flags, rc, properties=None):
+    logger.info(f"Connected with result code {rc}")
+    client.subscribe(BASE_TOPIC + "/#")
+    client.subscribe("homeassistant/status")
+    # client.subscribe(BASE_TOPIC + "/light/brightness/set")
+    send_discovery_messages(client)
+    republish_runtime_state(client)
 
 def on_message(client, userdata, msg):
     global brightness, speed, WATER_LOW_CM, food_last_fed, light_state, pump_state
@@ -745,6 +779,11 @@ def on_message(client, userdata, msg):
     topic_suffix = msg.topic.replace(BASE_TOPIC + "/", "")
 
     try:
+        if msg.topic == "homeassistant/status" and payload.lower() == "online":
+            send_discovery_messages(client)
+            republish_runtime_state(client)
+            return
+
         # === Pump Logic ===
         if topic_suffix == "pump/command":
             if payload.upper() == "ON":
@@ -761,12 +800,13 @@ def on_message(client, userdata, msg):
                     speed = DEFAULT_SPEED
                 get_pump().set_speed(speed)
                 pump_state = True
-                client.publish(BASE_TOPIC + "/pump/state", "ON")
-                client.publish(BASE_TOPIC + "/pump/speed/state", str(speed))
+                publish_pump_state(retain=True)
+                arm_pump_watchdog()
             elif payload.upper() == "OFF":
                 get_pump().off()
                 pump_state = False
-                client.publish(BASE_TOPIC + "/pump/state", "OFF")
+                publish_pump_state(retain=True)
+                cancel_pump_watchdog()
 
         elif topic_suffix == "pump/speed/set":
             parsed_speed = parse_percentage(payload, "pump speed")
@@ -776,12 +816,12 @@ def on_message(client, userdata, msg):
             if speed == 0:
                 get_pump().off()
                 pump_state = False
-                client.publish(BASE_TOPIC + "/pump/state", "OFF")
+                cancel_pump_watchdog()
             else:
                 get_pump().set_speed(speed)
                 pump_state = True
-                client.publish(BASE_TOPIC + "/pump/state", "ON")
-            client.publish(BASE_TOPIC + "/pump/speed/state", str(speed))
+                arm_pump_watchdog()
+            publish_pump_state(retain=True)
 
         # === Light Logic ===
         elif topic_suffix == "light/command":
@@ -790,12 +830,11 @@ def on_message(client, userdata, msg):
                     brightness = DEFAULT_BRIGHTNESS
                 get_light().set_duty_cycle(brightness)
                 light_state = True
-                client.publish(BASE_TOPIC + "/light/state", "ON")
-                client.publish(BASE_TOPIC + "/light/brightness/state", str(brightness))
+                publish_light_state(retain=True)
             elif payload.upper() == "OFF":
                 get_light().off()
                 light_state = False
-                client.publish(BASE_TOPIC + "/light/state", "OFF")
+                publish_light_state(retain=True)
 
         elif topic_suffix == "light/brightness/set":
             parsed_brightness = parse_percentage(payload, "light brightness")
@@ -805,12 +844,10 @@ def on_message(client, userdata, msg):
             if brightness == 0:
                 get_light().off()
                 light_state = False
-                client.publish(BASE_TOPIC + "/light/state", "OFF")
             else:
                 get_light().set_duty_cycle(brightness)
                 light_state = True
-                client.publish(BASE_TOPIC + "/light/state", "ON")
-            client.publish(BASE_TOPIC + "/light/brightness/state", str(brightness))
+            publish_light_state(retain=True)
 
         # === Water Level ===
         elif topic_suffix == "water/level/get":
